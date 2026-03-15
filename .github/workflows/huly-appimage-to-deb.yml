@@ -1,0 +1,361 @@
+name: Huly AppImage to Deb
+
+on:
+  schedule:
+    # Check every 6 hours for new releases
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: 'Force a specific version (e.g. 0.7.382). Leave empty to auto-detect latest.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  HULY_GITHUB_REPO: hcengineering/platform
+  APP_NAME: Huly
+  DEB_MAINTAINER: "Huly Deb Repackager <huly-deb@users.noreply.github.com>"
+  DEB_DESCRIPTION: "Huly — All-in-One Project Management Platform"
+  DEB_HOMEPAGE: "https://huly.io"
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get latest Huly version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.force_version }}" ]; then
+            VERSION="${{ github.event.inputs.force_version }}"
+            echo "Using forced version: $VERSION"
+          else
+            # Get latest release tag from the Huly platform repo
+            VERSION=$(curl -s "https://api.github.com/repos/${{ env.HULY_GITHUB_REPO }}/releases/latest" \
+              | jq -r '.tag_name' | sed 's/^v//')
+            echo "Latest upstream version: $VERSION"
+          fi
+
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::Failed to determine Huly version"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check_release
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}")
+
+          if [ "$HTTP_CODE" = "200" ] && [ -z "${{ github.event.inputs.force_version }}" ]; then
+            echo "Release ${TAG} already exists, skipping."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release ${TAG} does not exist yet (or forced). Proceeding."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Huly AppImage
+        if: steps.check_release.outputs.exists == 'false'
+        id: download
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          APPIMAGE_URL="https://dist.huly.io/Huly-linux-${VERSION}.AppImage"
+          APPIMAGE_FILE="Huly-linux-${VERSION}.AppImage"
+
+          echo "Downloading: $APPIMAGE_URL"
+          curl -fSL --retry 3 --retry-delay 5 -o "$APPIMAGE_FILE" "$APPIMAGE_URL"
+
+          if [ ! -s "$APPIMAGE_FILE" ]; then
+            echo "::error::Downloaded AppImage is empty or missing"
+            exit 1
+          fi
+
+          chmod +x "$APPIMAGE_FILE"
+          echo "appimage=$APPIMAGE_FILE" >> "$GITHUB_OUTPUT"
+          echo "Downloaded $(du -h "$APPIMAGE_FILE" | cut -f1) AppImage"
+
+      - name: Extract AppImage
+        if: steps.check_release.outputs.exists == 'false'
+        id: extract
+        run: |
+          APPIMAGE="${{ steps.download.outputs.appimage }}"
+          EXTRACT_DIR="squashfs-root"
+
+          # Extract the AppImage
+          ./"$APPIMAGE" --appimage-extract
+
+          if [ ! -d "$EXTRACT_DIR" ]; then
+            echo "::error::AppImage extraction failed"
+            exit 1
+          fi
+
+          echo "extract_dir=$EXTRACT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Extracted AppImage contents:"
+          ls -la "$EXTRACT_DIR"
+
+      - name: Detect architecture and app details
+        if: steps.check_release.outputs.exists == 'false'
+        id: detect
+        run: |
+          EXTRACT_DIR="${{ steps.extract.outputs.extract_dir }}"
+
+          # Detect architecture from the main binary
+          # Huly AppImage uses "desktop" as the binary name
+          MAIN_BIN=""
+          for candidate in desktop huly Huly huly-desktop; do
+            if [ -f "$EXTRACT_DIR/$candidate" ] && [ -x "$EXTRACT_DIR/$candidate" ]; then
+              MAIN_BIN="$EXTRACT_DIR/$candidate"
+              break
+            fi
+          done
+          if [ -z "$MAIN_BIN" ]; then
+            MAIN_BIN=$(find "$EXTRACT_DIR" -maxdepth 1 -type f -name "AppRun" | head -1)
+          fi
+          if [ -z "$MAIN_BIN" ]; then
+            MAIN_BIN=$(find "$EXTRACT_DIR" -maxdepth 1 -type f -executable \
+              ! -name "*.so" ! -name "*.so.*" | head -1)
+          fi
+
+          if file "$MAIN_BIN" | grep -q "x86-64"; then
+            DEB_ARCH="amd64"
+          elif file "$MAIN_BIN" | grep -q "aarch64"; then
+            DEB_ARCH="arm64"
+          elif file "$MAIN_BIN" | grep -q "ARM"; then
+            DEB_ARCH="armhf"
+          else
+            DEB_ARCH="amd64"
+            echo "::warning::Could not detect architecture, defaulting to amd64"
+          fi
+
+          echo "arch=$DEB_ARCH" >> "$GITHUB_OUTPUT"
+          echo "main_bin=$MAIN_BIN" >> "$GITHUB_OUTPUT"
+          echo "Detected architecture: $DEB_ARCH"
+
+      - name: Build .deb package
+        if: steps.check_release.outputs.exists == 'false'
+        id: build_deb
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCH="${{ steps.detect.outputs.arch }}"
+          EXTRACT_DIR="${{ steps.extract.outputs.extract_dir }}"
+          PKG_NAME="huly"
+          DEB_NAME="${PKG_NAME}_${VERSION}_${ARCH}.deb"
+          DEB_ROOT="deb-build"
+          INSTALL_DIR="${DEB_ROOT}/opt/huly"
+          BIN_DIR="${DEB_ROOT}/usr/bin"
+          DESKTOP_DIR="${DEB_ROOT}/usr/share/applications"
+          ICON_DIR="${DEB_ROOT}/usr/share/icons/hicolor"
+
+          # Create directory structure
+          mkdir -p "$INSTALL_DIR"
+          mkdir -p "$BIN_DIR"
+          mkdir -p "$DESKTOP_DIR"
+          mkdir -p "${DEB_ROOT}/DEBIAN"
+
+          # Copy application files
+          cp -a "${EXTRACT_DIR}/." "$INSTALL_DIR/"
+
+          # Find the actual executable name
+          EXEC_NAME=""
+          for candidate in desktop huly Huly huly-desktop; do
+            if [ -f "${INSTALL_DIR}/${candidate}" ] && [ -x "${INSTALL_DIR}/${candidate}" ]; then
+              EXEC_NAME="$candidate"
+              break
+            fi
+          done
+          # Fallback: find any top-level ELF binary (skip .so files)
+          if [ -z "$EXEC_NAME" ]; then
+            EXEC_NAME=$(find "$INSTALL_DIR" -maxdepth 1 -type f -executable \
+              ! -name "*.so" ! -name "*.so.*" \
+              -exec sh -c 'file "$1" | grep -q ELF && basename "$1"' _ {} \; | head -1)
+          fi
+
+          if [ -z "$EXEC_NAME" ]; then
+            echo "::error::Could not find main executable in extracted AppImage"
+            ls -la "$INSTALL_DIR"
+            exit 1
+          fi
+
+          echo "Main executable: $EXEC_NAME"
+
+          # Create launcher script
+          cat > "${BIN_DIR}/huly" << 'LAUNCHER'
+          #!/bin/bash
+          # Huly Desktop Launcher
+          exec /opt/huly/EXEC_PLACEHOLDER --no-sandbox "$@"
+          LAUNCHER
+          sed -i "s|EXEC_PLACEHOLDER|${EXEC_NAME}|g" "${BIN_DIR}/huly"
+          chmod 755 "${BIN_DIR}/huly"
+
+          # Install icons if available
+          for size in 16 32 48 64 128 256 512 1024; do
+            ICON_SRC=""
+            for ext in png svg; do
+              for pattern in \
+                "${EXTRACT_DIR}/usr/share/icons/hicolor/${size}x${size}/apps/"*.${ext} \
+                "${EXTRACT_DIR}/${size}x${size}."${ext} \
+                "${EXTRACT_DIR}/icons/${size}x${size}."${ext}; do
+                if ls $pattern 2>/dev/null | head -1 > /dev/null 2>&1; then
+                  ICON_SRC=$(ls $pattern 2>/dev/null | head -1)
+                  break 2
+                fi
+              done
+            done
+            if [ -n "$ICON_SRC" ]; then
+              ICON_EXT="${ICON_SRC##*.}"
+              mkdir -p "${ICON_DIR}/${size}x${size}/apps"
+              cp "$ICON_SRC" "${ICON_DIR}/${size}x${size}/apps/huly.${ICON_EXT}"
+            fi
+          done
+
+          # Also grab any top-level icon
+          if [ -f "${EXTRACT_DIR}/huly.png" ]; then
+            mkdir -p "${ICON_DIR}/256x256/apps"
+            cp "${EXTRACT_DIR}/huly.png" "${ICON_DIR}/256x256/apps/huly.png"
+          elif [ -f "${EXTRACT_DIR}/.DirIcon" ]; then
+            mkdir -p "${ICON_DIR}/256x256/apps"
+            cp "${EXTRACT_DIR}/.DirIcon" "${ICON_DIR}/256x256/apps/huly.png"
+          fi
+
+          # Create .desktop file
+          if [ -f "${EXTRACT_DIR}/huly.desktop" ] || [ -f "${EXTRACT_DIR}"/*.desktop ]; then
+            DESKTOP_SRC=$(ls "${EXTRACT_DIR}"/*.desktop 2>/dev/null | head -1)
+            cp "$DESKTOP_SRC" "${DESKTOP_DIR}/huly.desktop"
+            # Fix paths in the desktop file
+            sed -i "s|Exec=.*|Exec=/usr/bin/huly %U|g" "${DESKTOP_DIR}/huly.desktop"
+            sed -i "s|Icon=.*|Icon=huly|g" "${DESKTOP_DIR}/huly.desktop"
+          else
+            cat > "${DESKTOP_DIR}/huly.desktop" << EOF
+          [Desktop Entry]
+          Name=Huly
+          Comment=${{ env.DEB_DESCRIPTION }}
+          Exec=/usr/bin/huly %U
+          Icon=huly
+          Type=Application
+          Categories=Office;ProjectManagement;
+          StartupWMClass=Huly
+          MimeType=x-scheme-handler/huly;
+          EOF
+          fi
+
+          # Calculate installed size (in KB)
+          INSTALLED_SIZE=$(du -sk "$INSTALL_DIR" | cut -f1)
+
+          # Create DEBIAN/control
+          cat > "${DEB_ROOT}/DEBIAN/control" << EOF
+          Package: ${PKG_NAME}
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: ${ARCH}
+          Installed-Size: ${INSTALLED_SIZE}
+          Depends: libgtk-3-0, libnotify4, libnss3, libxss1, libxtst6, xdg-utils, libatspi2.0-0, libuuid1, libsecret-1-0
+          Maintainer: ${{ env.DEB_MAINTAINER }}
+          Homepage: ${{ env.DEB_HOMEPAGE }}
+          Description: ${{ env.DEB_DESCRIPTION }}
+           Huly is an open-source all-in-one project management platform.
+           It provides issue tracking, team planning, knowledge management,
+           and collaboration tools. This package is an unofficial repackaging
+           of the official Huly AppImage into .deb format.
+          EOF
+
+          # Create postinst script to update desktop database
+          cat > "${DEB_ROOT}/DEBIAN/postinst" << 'EOF'
+          #!/bin/bash
+          set -e
+          if command -v update-desktop-database > /dev/null 2>&1; then
+            update-desktop-database -q /usr/share/applications || true
+          fi
+          if command -v gtk-update-icon-cache > /dev/null 2>&1; then
+            gtk-update-icon-cache -q /usr/share/icons/hicolor || true
+          fi
+          # Fix chrome-sandbox permissions if present
+          if [ -f /opt/huly/chrome-sandbox ]; then
+            chmod 4755 /opt/huly/chrome-sandbox
+          fi
+          EOF
+          chmod 755 "${DEB_ROOT}/DEBIAN/postinst"
+
+          # Create postrm script
+          cat > "${DEB_ROOT}/DEBIAN/postrm" << 'EOF'
+          #!/bin/bash
+          set -e
+          if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+            if command -v update-desktop-database > /dev/null 2>&1; then
+              update-desktop-database -q /usr/share/applications || true
+            fi
+          fi
+          EOF
+          chmod 755 "${DEB_ROOT}/DEBIAN/postrm"
+
+          # Fix permissions
+          find "${DEB_ROOT}" -type d -exec chmod 755 {} \;
+          find "${DEB_ROOT}/DEBIAN" -type f -exec chmod 644 {} \;
+          chmod 755 "${DEB_ROOT}/DEBIAN/postinst" "${DEB_ROOT}/DEBIAN/postrm"
+          chmod 755 "${INSTALL_DIR}/${EXEC_NAME}"
+
+          # Build the .deb
+          dpkg-deb --build --root-owner-group "$DEB_ROOT" "$DEB_NAME"
+
+          if [ ! -f "$DEB_NAME" ]; then
+            echo "::error::Failed to build .deb package"
+            exit 1
+          fi
+
+          echo "deb_file=$DEB_NAME" >> "$GITHUB_OUTPUT"
+          echo "Successfully built: $DEB_NAME ($(du -h "$DEB_NAME" | cut -f1))"
+
+      - name: Verify .deb package
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          DEB_FILE="${{ steps.build_deb.outputs.deb_file }}"
+          echo "=== Package Info ==="
+          dpkg-deb --info "$DEB_FILE"
+          echo ""
+          echo "=== Package Contents (top-level) ==="
+          dpkg-deb --contents "$DEB_FILE" | head -30
+
+      - name: Create GitHub Release
+        if: steps.check_release.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ steps.version.outputs.version }}"
+          name: "Huly ${{ steps.version.outputs.version }} (.deb)"
+          body: |
+            ## Huly ${{ steps.version.outputs.version }} — Unofficial .deb Package
+
+            This is an **unofficial** repackaging of the [Huly](https://huly.io) desktop application
+            from AppImage to `.deb` format for Debian/Ubuntu-based distributions.
+
+            **Upstream release**: [v${{ steps.version.outputs.version }}](https://github.com/${{ env.HULY_GITHUB_REPO }}/releases/tag/v${{ steps.version.outputs.version }})
+
+            ### Install
+            ```bash
+            sudo dpkg -i ${{ steps.build_deb.outputs.deb_file }}
+            sudo apt-get install -f  # fix any missing dependencies
+            ```
+
+            ### Uninstall
+            ```bash
+            sudo apt remove huly
+            ```
+
+            ---
+            *This package is automatically generated from the official Huly AppImage.
+            For the official release, visit [huly.io/download](https://huly.io/download).*
+          files: ${{ steps.build_deb.outputs.deb_file }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
