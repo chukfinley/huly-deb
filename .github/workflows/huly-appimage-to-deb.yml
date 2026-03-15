@@ -2,8 +2,8 @@ name: Huly AppImage to Deb
 
 on:
   schedule:
-    # Check every 6 hours for new releases
-    - cron: '0 */6 * * *'
+    # Check once per week (Monday 08:00 UTC)
+    - cron: '0 8 * * 1'
   workflow_dispatch:
     inputs:
       force_version:
