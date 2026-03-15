@@ -139,45 +139,84 @@ if [ -z "$EXEC_NAME" ]; then
 fi
 echo "==> Main executable: $EXEC_NAME"
 
-# Create launcher script
+# Create default config.json so the app doesn't error on first launch
+mkdir -p "${INSTALL_DIR}/resources/config"
+echo '{}' > "${INSTALL_DIR}/resources/config/config.json"
+
+# Create launcher script (mirrors what AppRun does — no extra flags)
 cat > "${BIN_DIR}/huly" << EOF
 #!/bin/bash
 # Huly Desktop Launcher
-exec /opt/huly/${EXEC_NAME} --no-sandbox "\$@"
+export PATH="/opt/huly:\${PATH}"
+export LD_LIBRARY_PATH="/opt/huly:\${LD_LIBRARY_PATH}"
+exec /opt/huly/${EXEC_NAME} "\$@"
 EOF
 chmod 755 "${BIN_DIR}/huly"
 
 # ── Step 6: Icons ─────────────────────────────────────────────────────────────
 echo "==> Installing icons..."
-for size in 16 32 48 64 128 256 512 1024; do
-  ICON_SRC=""
-  for ext in png svg; do
-    for pattern in \
-      "${EXTRACT_DIR}/usr/share/icons/hicolor/${size}x${size}/apps/"*.${ext} \
-      "${EXTRACT_DIR}/${size}x${size}."${ext} \
-      "${EXTRACT_DIR}/icons/${size}x${size}."${ext}; do
-      found=$(ls $pattern 2>/dev/null | head -1 || true)
-      if [ -n "$found" ]; then
-        ICON_SRC="$found"
-        break 2
-      fi
-    done
-  done
-  if [ -n "$ICON_SRC" ]; then
-    ICON_EXT="${ICON_SRC##*.}"
-    mkdir -p "${ICON_DIR}/${size}x${size}/apps"
-    cp "$ICON_SRC" "${ICON_DIR}/${size}x${size}/apps/huly.${ICON_EXT}"
-    echo "    ${size}x${size}: installed"
+
+# Find the source icon from the AppImage (Huly uses "desktop.png" as its icon)
+SRC_ICON=""
+for candidate in "${EXTRACT_DIR}/desktop.png" "${EXTRACT_DIR}/huly.png" "${EXTRACT_DIR}/.DirIcon"; do
+  if [ -f "$candidate" ]; then
+    SRC_ICON="$candidate"
+    break
   fi
 done
 
-# Grab top-level icon as fallback
-if [ -f "${EXTRACT_DIR}/huly.png" ]; then
-  mkdir -p "${ICON_DIR}/256x256/apps"
-  cp "${EXTRACT_DIR}/huly.png" "${ICON_DIR}/256x256/apps/huly.png"
-elif [ -f "${EXTRACT_DIR}/.DirIcon" ]; then
-  mkdir -p "${ICON_DIR}/256x256/apps"
-  cp "${EXTRACT_DIR}/.DirIcon" "${ICON_DIR}/256x256/apps/huly.png"
+if [ -n "$SRC_ICON" ]; then
+  # Check actual pixel size of the source icon (follow symlinks with -L)
+  SRC_SIZE=$(file -L "$SRC_ICON" | grep -oP '\d+ x \d+' | head -1 | cut -d' ' -f1 || true)
+  echo "    Source icon: $SRC_ICON (${SRC_SIZE}x${SRC_SIZE})"
+
+  # Install at the actual native size
+  if [ -n "$SRC_SIZE" ]; then
+    mkdir -p "${ICON_DIR}/${SRC_SIZE}x${SRC_SIZE}/apps"
+    cp -L "$SRC_ICON" "${ICON_DIR}/${SRC_SIZE}x${SRC_SIZE}/apps/huly.png"
+    echo "    ${SRC_SIZE}x${SRC_SIZE}: installed (native)"
+  fi
+
+  # Generate smaller sizes if convert (imagemagick) is available
+  if command -v convert > /dev/null 2>&1; then
+    for size in 48 64 128 256 512; do
+      if [ "$size" -lt "${SRC_SIZE:-0}" ]; then
+        mkdir -p "${ICON_DIR}/${size}x${size}/apps"
+        convert "$SRC_ICON" -resize "${size}x${size}" "${ICON_DIR}/${size}x${size}/apps/huly.png"
+        echo "    ${size}x${size}: generated"
+      fi
+    done
+  else
+    echo "    (install imagemagick for additional icon sizes: sudo apt install imagemagick)"
+    # Without imagemagick, install the original in common sizes so DEs can find it
+    for size in 256 512; do
+      mkdir -p "${ICON_DIR}/${size}x${size}/apps"
+      cp "$SRC_ICON" "${ICON_DIR}/${size}x${size}/apps/huly.png"
+    done
+  fi
+
+  # Also install as pixmap fallback (some DEs look here)
+  mkdir -p "${DEB_ROOT}/usr/share/pixmaps"
+  cp -L "$SRC_ICON" "${DEB_ROOT}/usr/share/pixmaps/huly.png"
+  echo "    pixmaps: installed"
+else
+  echo "    WARNING: No icon found in AppImage"
+fi
+
+# Also copy any properly-sized icons from the AppImage's hicolor tree
+if [ -d "${EXTRACT_DIR}/usr/share/icons/hicolor" ]; then
+  for size_dir in "${EXTRACT_DIR}/usr/share/icons/hicolor/"*/; do
+    if [ -d "$size_dir/apps" ]; then
+      size_name=$(basename "$size_dir")
+      for icon_file in "$size_dir/apps/"*.png "$size_dir/apps/"*.svg; do
+        if [ -f "$icon_file" ]; then
+          mkdir -p "${ICON_DIR}/${size_name}/apps"
+          cp "$icon_file" "${ICON_DIR}/${size_name}/apps/huly.${icon_file##*.}"
+          echo "    ${size_name}: installed (from hicolor)"
+        fi
+      done
+    fi
+  done
 fi
 
 # ── Step 7: Desktop entry ────────────────────────────────────────────────────
